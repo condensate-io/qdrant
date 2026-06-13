@@ -18,12 +18,14 @@ use crate::quantile::find_quantile_interval_per_coordinate_with_preprocess;
 use crate::turboquant::math::std_normal_cdf;
 use crate::turboquant::quantization::{ErrorCorrection, TurboQuantizer};
 use crate::turboquant::{EncodedQueryTQ, TQBits, TQMode};
+use crate::turboquant::storage::fastscan::{FastScanStorage, BLOCK_SIZE};
 
 pub struct EncodedVectorsTQ<TStorage: EncodedStorage> {
     encoded_vectors: TStorage,
     metadata: Metadata,
     metadata_path: Option<PathBuf>,
     quantizer: TurboQuantizer,
+    fastscan_blocks: Option<FastScanStorage>,
 
     // Buffer used when encoding vectors.
     encoding_buffer: Vec<f64>,
@@ -266,13 +268,16 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
             })?;
         }
 
-        Ok(Self {
+        let mut result = Self {
             encoded_vectors,
             metadata,
             metadata_path: meta_path.map(PathBuf::from),
             encoding_buffer: vec![0.0f64; quantizer.padded_dim],
             quantizer,
-        })
+            fastscan_blocks: None,
+        };
+        result.build_fastscan();
+        Ok(result)
     }
 
     pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
@@ -281,13 +286,17 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
 
         let quantizer = new_turbo_quantizer_from_metadata(&metadata)?;
 
-        let result = Self {
+        let mut result = Self {
             encoded_vectors,
             metadata,
             metadata_path: Some(meta_path.to_path_buf()),
             encoding_buffer: vec![0.0f64; quantizer.padded_dim],
             quantizer,
+            fastscan_blocks: None,
         };
+        if !result.encoded_vectors.is_on_disk() {
+            result.build_fastscan();
+        }
 
         // Validate the storage's vector size against the metadata once here, so the size
         // invariant the scoring hot path relies on (it splits each stored vector into packed
@@ -296,6 +305,50 @@ impl<TStorage: EncodedStorage> EncodedVectorsTQ<TStorage> {
         validate_storage_vector_size(&result.encoded_vectors, result.quantized_vector_size())?;
 
         Ok(result)
+    }
+
+    pub fn build_fastscan(&mut self) {
+        if self.fastscan_blocks.is_some() || self.metadata.bits != TQBits::Bits4 {
+            return;
+        }
+        let count = self.encoded_vectors.vectors_count();
+        let mut fs = FastScanStorage::new(self.quantized_vector_size());
+        
+        let mut block = Vec::with_capacity(BLOCK_SIZE);
+        let mut scalings = Vec::with_capacity(BLOCK_SIZE);
+        let mut l2s = Vec::with_capacity(BLOCK_SIZE);
+
+        for i in 0..count {
+            let vec_data = self.encoded_vectors.get_vector_data(i as PointOffsetType);
+            let (scaling, l2) = {
+                let (_, extras) = self.quantizer.split_vector(&vec_data);
+                let l2 = if self.metadata.vector_parameters.distance_type == crate::encoded_vectors::DistanceType::L2 {
+                    extras.l2_length()
+                } else {
+                    0.0
+                };
+                (extras.scaling_factor(), l2)
+            };
+            block.push(vec_data.into_owned());
+            scalings.push(scaling);
+            l2s.push(l2);
+
+            if block.len() == BLOCK_SIZE {
+                let refs: Vec<&[u8]> = block.iter().map(|v| v.as_slice()).collect();
+                fs.push_block(&refs, &scalings, &l2s);
+                block.clear();
+                scalings.clear();
+                l2s.clear();
+            }
+        }
+        if !block.is_empty() {
+            while block.len() < BLOCK_SIZE {
+                block.push(vec![0; self.quantized_vector_size()]);
+            }
+            let refs: Vec<&[u8]> = block.iter().map(|v| v.as_slice()).collect();
+            fs.push_block(&refs, &scalings, &l2s);
+        }
+        self.fastscan_blocks = Some(fs);
     }
 
     fn encode_vector(
@@ -374,6 +427,53 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsTQ<TStorage> {
         self.score_bytes(True, query, &encoded_vector, hw_counter)
     }
 
+    fn score_batch(
+        &self,
+        query: &Self::EncodedQuery,
+        ids: &[PointOffsetType],
+        scores: &mut [f32],
+        hw_counter: &HardwareCounterCell,
+    ) {
+        let mut used_fastscan = false;
+        if let Some(fs) = &self.fastscan_blocks {
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") && self.metadata.bits == TQBits::Bits4 {
+                used_fastscan = true;
+                let mut current_block_idx = usize::MAX;
+                let mut block_scores = [0f32; 32];
+                
+                for (idx, &id) in ids.iter().enumerate() {
+                    let block_idx = (id as usize) / BLOCK_SIZE;
+                    let in_block_idx = (id as usize) % BLOCK_SIZE;
+                    
+                    if block_idx != current_block_idx {
+                        if let Some((block, b_scalings, b_l2s)) = fs.get_block(block_idx) {
+                            if let Some(s) = self.quantizer.score_block32_avx2(query, block, b_scalings, b_l2s) {
+                                block_scores = s;
+                            }
+                        } else {
+                            block_scores = [0f32; 32];
+                        }
+                        current_block_idx = block_idx;
+                    }
+                    
+                    let score = block_scores[in_block_idx];
+                    scores[idx] = if self.metadata.vector_parameters.invert {
+                        -score
+                    } else {
+                        score
+                    };
+                }
+            }
+        }
+
+        if !used_fastscan {
+            for (idx, vector) in self.iter_batch(ids) {
+                scores[idx] = self.score(query, &vector, hw_counter);
+            }
+        }
+    }
+
     /// Score two points inside endoded data by their indexes
     fn score_internal(
         &self,
@@ -409,13 +509,20 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsTQ<TStorage> {
             metadata_path: _,
             quantizer,
             encoding_buffer,
+            fastscan_blocks,
         } = self;
-        // Storage backend (the quantized vectors themselves; non-zero for the
-        // RAM-backed variants), plus the always-resident quantizer tables and
-        // the per-instance encoding scratch buffer.
-        encoded_vectors.heap_size_bytes()
+        
+        let mut size = encoded_vectors.heap_size_bytes()
             + quantizer.heap_size_bytes()
-            + encoding_buffer.capacity() * size_of::<f64>()
+            + encoding_buffer.capacity() * size_of::<f64>();
+            
+        if let Some(fs) = fastscan_blocks {
+            size += fs.blocks.capacity() * std::mem::size_of::<u8>();
+            size += fs.scaling_factors.capacity() * std::mem::size_of::<f32>();
+            size += fs.l2_lengths.capacity() * std::mem::size_of::<f32>();
+        }
+        
+        size
     }
 
     fn encode_internal_vector(&self, _id: PointOffsetType) -> Option<EncodedQueryTQ> {

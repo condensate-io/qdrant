@@ -68,6 +68,18 @@ pub trait EncodedVectors: Sized {
         hw_counter: &HardwareCounterCell,
     ) -> f32;
 
+    fn score_batch(
+        &self,
+        query: &Self::EncodedQuery,
+        ids: &[PointOffsetType],
+        scores: &mut [f32],
+        hw_counter: &HardwareCounterCell,
+    ) {
+        for (idx, vector) in self.iter_batch(ids) {
+            scores[idx] = self.score(query, &vector, hw_counter);
+        }
+    }
+
     fn score_internal(
         &self,
         i: PointOffsetType,

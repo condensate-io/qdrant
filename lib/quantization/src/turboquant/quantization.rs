@@ -516,6 +516,37 @@ impl TurboQuantizer {
     /// Similarity score with a query that has already been rotated via
     /// [`Self::precompute_query`]. Returns an approximate `<query, v>` for Dot
     /// and `cos(θ)` for Cosine.
+    pub fn score_block32_avx2(&self, query: &EncodedQueryTQ, block: &[u8], scalings: &[f32], l2s: &[f32]) -> Option<[f32; 32]> {
+        if let crate::turboquant::EncodedQueryTQData::Bits4(q) = &query.data {
+            #[cfg(target_arch = "x86_64")]
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let raw_scores = unsafe { q.dotprod_raw_avx2_block32(block) };
+                let mut final_scores = [0f32; 32];
+                match self.distance {
+                    crate::encoded_vectors::DistanceType::Dot | crate::encoded_vectors::DistanceType::Cosine => {
+                        for i in 0..32 {
+                            let dot = raw_scores[i] as f32 + query.ec_correction;
+                            final_scores[i] = dot * scalings[i];
+                        }
+                    }
+                    crate::encoded_vectors::DistanceType::L2 => {
+                        let query_l2 = query.l2_norm.unwrap_or(1.0);
+                        let query_l2_sq = query_l2 * query_l2;
+                        for i in 0..32 {
+                            let dot = raw_scores[i] as f32 + query.ec_correction;
+                            final_scores[i] = query_l2_sq + l2s[i] * l2s[i] - 2.0 * dot * scalings[i];
+                        }
+                    }
+                    crate::encoded_vectors::DistanceType::L1 => {
+                        return None;
+                    }
+                }
+                return Some(final_scores);
+            }
+        }
+        None
+    }
+
     pub fn score_precomputed(&self, query: &EncodedQueryTQ, vec: &[u8]) -> f32 {
         let (data_bytes, vector_extras) = self.split_vector(vec);
         let raw_dot = match &query.data {

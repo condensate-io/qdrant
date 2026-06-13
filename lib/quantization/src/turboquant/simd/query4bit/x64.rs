@@ -236,6 +236,90 @@ impl Query4bitSimd {
                 + QUERY_HIGH_COEF * i64::from(hsum_i32_sse(sum_high_xmm))
         }
     }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(unsafe_op_in_unsafe_fn)]
+    pub unsafe fn dotprod_raw_avx2_block32(&self, block: &[u8]) -> [i32; 32] {
+        use core::arch::x86_64::*;
+        let codebook_128 = _mm_loadu_si128(CODEBOOK_U8.as_ptr().cast::<__m128i>());
+        let codebook = _mm256_broadcastsi128_si256(codebook_128);
+        let nibble_mask = _mm256_set1_epi8(0x0F);
+
+        let mut acc0_low = _mm256_setzero_si256();
+        let mut acc1_low = _mm256_setzero_si256();
+        let mut acc2_low = _mm256_setzero_si256();
+        let mut acc3_low = _mm256_setzero_si256();
+
+        let mut acc0_high = _mm256_setzero_si256();
+        let mut acc1_high = _mm256_setzero_si256();
+        let mut acc2_high = _mm256_setzero_si256();
+        let mut acc3_high = _mm256_setzero_si256();
+
+        for (chunk_idx, chunk) in self.query_data.iter().enumerate() {
+            let q_low = chunk[0];
+            let q_high = chunk[1];
+
+            for i in 0..8 {
+                let offset = chunk_idx * 8 + i;
+                let block_ptr = block.as_ptr().add(offset * 32).cast::<__m256i>();
+                let v_packed = _mm256_loadu_si256(block_ptr);
+
+                let v_lo = _mm256_and_si256(v_packed, nibble_mask);
+                let v_hi = _mm256_and_si256(_mm256_srli_epi16(v_packed, 4), nibble_mask);
+
+                let v1 = _mm256_unpacklo_epi8(v_lo, v_hi);
+                let v2 = _mm256_unpackhi_epi8(v_lo, v_hi);
+
+                let c1 = _mm256_shuffle_epi8(codebook, v1);
+                let c2 = _mm256_shuffle_epi8(codebook, v2);
+
+                let q_l = q_low[i * 2] as u16 | ((q_low[i * 2 + 1] as u16) << 8);
+                let q_l_bcast = _mm256_set1_epi16(q_l as i16);
+                let q_h = q_high[i * 2] as u16 | ((q_high[i * 2 + 1] as u16) << 8);
+                let q_h_bcast = _mm256_set1_epi16(q_h as i16);
+
+                let p1_low = _mm256_maddubs_epi16(c1, q_l_bcast);
+                let p2_low = _mm256_maddubs_epi16(c2, q_l_bcast);
+                let p1_high = _mm256_maddubs_epi16(c1, q_h_bcast);
+                let p2_high = _mm256_maddubs_epi16(c2, q_h_bcast);
+
+                acc0_low = _mm256_add_epi32(acc0_low, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(p1_low)));
+                acc1_low = _mm256_add_epi32(acc1_low, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(p1_low, 1)));
+                acc2_low = _mm256_add_epi32(acc2_low, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(p2_low)));
+                acc3_low = _mm256_add_epi32(acc3_low, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(p2_low, 1)));
+
+                acc0_high = _mm256_add_epi32(acc0_high, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(p1_high)));
+                acc1_high = _mm256_add_epi32(acc1_high, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(p1_high, 1)));
+                acc2_high = _mm256_add_epi32(acc2_high, _mm256_cvtepi16_epi32(_mm256_castsi256_si128(p2_high)));
+                acc3_high = _mm256_add_epi32(acc3_high, _mm256_cvtepi16_epi32(_mm256_extracti128_si256(p2_high, 1)));
+            }
+        }
+
+        // Add high * QUERY_HIGH_COEF + low
+        let high_coef = _mm256_set1_epi32(super::QUERY_HIGH_COEF as i32);
+        
+        let mut sum = [0i32; 32];
+        let acc0 = _mm256_add_epi32(acc0_low, _mm256_mullo_epi32(acc0_high, high_coef));
+        let acc1 = _mm256_add_epi32(acc1_low, _mm256_mullo_epi32(acc1_high, high_coef));
+        let acc2 = _mm256_add_epi32(acc2_low, _mm256_mullo_epi32(acc2_high, high_coef));
+        let acc3 = _mm256_add_epi32(acc3_low, _mm256_mullo_epi32(acc3_high, high_coef));
+        
+        let mut t0 = [0i32; 8]; _mm256_storeu_si256(t0.as_mut_ptr().cast(), acc0);
+        let mut t1 = [0i32; 8]; _mm256_storeu_si256(t1.as_mut_ptr().cast(), acc1);
+        let mut t2 = [0i32; 8]; _mm256_storeu_si256(t2.as_mut_ptr().cast(), acc2);
+        let mut t3 = [0i32; 8]; _mm256_storeu_si256(t3.as_mut_ptr().cast(), acc3);
+
+        sum[0..4].copy_from_slice(&t0[0..4]);
+        sum[16..20].copy_from_slice(&t0[4..8]);
+        sum[4..8].copy_from_slice(&t1[0..4]);
+        sum[20..24].copy_from_slice(&t1[4..8]);
+        sum[8..12].copy_from_slice(&t2[0..4]);
+        sum[24..28].copy_from_slice(&t2[4..8]);
+        sum[12..16].copy_from_slice(&t3[0..4]);
+        sum[28..32].copy_from_slice(&t3[4..8]);
+
+        sum
+    }
 }
 
 #[target_feature(enable = "sse2")]
